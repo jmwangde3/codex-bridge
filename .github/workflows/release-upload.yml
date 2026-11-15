@@ -1,0 +1,145 @@
+name: Collect v3.0.3 release assets
+on:
+  push:
+    branches: [codex/release-3.0.3-upload-42ffe1a9]
+permissions:
+  actions: read
+  contents: write
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_SHA: 42ffe1a9c88a806d0c00063c2af365f380e55ac5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 42ffe1a9c88a806d0c00063c2af365f380e55ac5
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.11.1
+      - name: Wait for verified native builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view v3.0.3 --json isDraft,tagName | jq -e '.isDraft and .tagName == "v3.0.3"'
+          for run in 43737862277 43737862271 43737862420; do
+            for attempt in $(seq 1 240); do
+              data=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run")
+              jq -e --arg sha "$RELEASE_SHA" '.head_sha == $sha and .head_branch == "win" and .event == "push"' <<< "$data" > /dev/null
+              status=$(jq -r '.status + " " + (.conclusion // "pending")' <<< "$data")
+              if [[ "$status" == "completed success" ]]; then echo "$run passed"; break; fi
+              if [[ "$status" == completed* ]]; then echo "$run: $status" >&2; exit 1; fi
+              if [[ "$attempt" == 240 ]]; then echo "$run timed out" >&2; exit 1; fi
+              sleep 30
+            done
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: ${{ runner.temp }}/builds/macos-arm64
+          run-id: 43737862277
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-x86_64
+          path: ${{ runner.temp }}/builds/macos-x86_64
+          run-id: 43737862277
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: codex-bridge-linux-x64
+          path: ${{ runner.temp }}/builds/linux-x64
+          run-id: 43737862271
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: codex-bridge-linux-arm64
+          path: ${{ runner.temp }}/builds/linux-arm64
+          run-id: 43737862271
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: codex-bridge-windows-x64
+          path: ${{ runner.temp }}/builds/windows-x64
+          run-id: 43737862420
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: codex-bridge-windows-x64-installer
+          path: ${{ runner.temp }}/builds/windows-x64-installer
+          run-id: 43737862420
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: codex-bridge-windows-arm64
+          path: ${{ runner.temp }}/builds/windows-arm64
+          run-id: 43737862420
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: codex-bridge-windows-arm64-installer
+          path: ${{ runner.temp }}/builds/windows-arm64-installer
+          run-id: 43737862420
+          github-token: ${{ github.token }}
+      - name: Prepare complete release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          builds="$RUNNER_TEMP/builds"
+          bundle="$RUNNER_TEMP/bundle"
+          report="$RUNNER_TEMP/release-report"
+          mkdir -p "$bundle" "$report"
+          for arch in arm64 x86_64; do
+            ln "$builds/macos-$arch/CodexBridge-3.0.3-macos-$arch.zip" "$bundle/"
+            ln "$builds/macos-$arch/CodexBridge-3.0.3-macos-$arch.dmg" "$bundle/"
+          done
+          for file in LICENSE NOTICE PRIVACY.md DEPENDENCIES.md SBOM.spdx.json RELEASE-INFO.txt; do
+            cp "$builds/macos-arm64/$file" "$bundle/"
+          done
+          for arch in x64 arm64; do
+            ln "$builds/linux-$arch/codex-bridge-linux-$arch-3.0.3.tar.gz" "$bundle/"
+            ln "$builds/linux-$arch/CodexBridge-Linux-$arch-3.0.3.deb" "$bundle/"
+            info="$builds/windows-$arch-installer/INSTALLER-BUILD-INFO.json"
+            jq -e --arg sha "$RELEASE_SHA" --arg arch "$arch" \
+              '.appVersion == "3.0.3" and .architecture == $arch and .payloadGitCommit == $sha' "$info"
+            cp "$info" "$report/windows-$arch.json"
+            ln "$builds/windows-$arch/codex-bridge-windows-$arch.zip" "$bundle/"
+            installer="$builds/windows-$arch-installer/CodexBridge-Windows-$arch-3.0.3-Setup.exe"
+            expected=$(jq -r '.sha256 | ascii_downcase' "$info")
+            echo "$expected  $installer" | sha256sum --check
+            ln "$installer" "$bundle/"
+          done
+          gh release download v3.0.3 --pattern codex-bridge-3.0.3.mcpb --pattern server.json --dir "$bundle"
+          node Scripts/verify-mcpb-release.mjs "$bundle/codex-bridge-3.0.3.mcpb" "$bundle/server.json" v3.0.3 "$GITHUB_REPOSITORY"
+          python3 Scripts/generate-update-manifest.py --output "$bundle/latest.json" --version 3.0.3 --tag v3.0.3 \
+            --notes-file docs/RELEASE_NOTES_v3.0.3.md \
+            --asset macos arm64 app "$bundle/CodexBridge-3.0.3-macos-arm64.zip" \
+            --asset macos x64 app "$bundle/CodexBridge-3.0.3-macos-x86_64.zip" \
+            --asset windows x64 installer "$bundle/CodexBridge-Windows-x64-3.0.3-Setup.exe" \
+            --asset windows arm64 installer "$bundle/CodexBridge-Windows-arm64-3.0.3-Setup.exe" \
+            --asset windows x64 portable "$bundle/codex-bridge-windows-x64.zip" \
+            --asset windows arm64 portable "$bundle/codex-bridge-windows-arm64.zip" \
+            --asset linux x64 installer "$bundle/CodexBridge-Linux-x64-3.0.3.deb" \
+            --asset linux arm64 installer "$bundle/CodexBridge-Linux-arm64-3.0.3.deb" \
+            --asset linux x64 portable "$bundle/codex-bridge-linux-x64-3.0.3.tar.gz" \
+            --asset linux arm64 portable "$bundle/codex-bridge-linux-arm64-3.0.3.tar.gz"
+          (cd "$bundle" && LC_ALL=C sha256sum * > "$RUNNER_TEMP/SHA256SUMS")
+          mv "$RUNNER_TEMP/SHA256SUMS" "$bundle/SHA256SUMS"
+          cp "$bundle/latest.json" "$bundle/SHA256SUMS" "$bundle/RELEASE-INFO.txt" "$report/"
+      - name: Upload packages to draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/bundle"
+          gh release upload v3.0.3 * --clobber
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v3.0.3" > "$RUNNER_TEMP/release-report/draft-assets.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-report-v3.0.3
+          path: ${{ runner.temp }}/release-report/*
+          if-no-files-found: warn
